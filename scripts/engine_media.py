@@ -37,6 +37,9 @@ DEFAULT_WEIGHTS = {
 }
 SAMPLE_RATE = 16000
 FRAME_WIDTH, FRAME_HEIGHT, FRAME_RATE = 144, 80, 2
+OUTPUT_WIDTH, OUTPUT_HEIGHT = 1080, 1920
+FACECAM_HEIGHT = 670
+GAMEPLAY_HEIGHT = OUTPUT_HEIGHT - FACECAM_HEIGHT
 VIDEO_SUFFIXES = {".mp4", ".m4v", ".mov", ".mkv", ".webm", ".ts"}
 AUDIO_SUFFIXES = {".wav", ".m4a", ".mp3", ".aac", ".ogg", ".flac"}
 DEMUXERS = "mov,matroska,webm,mpegts,wav,mp3,flac,ogg,aac"
@@ -64,6 +67,10 @@ class MediaError(RuntimeError):
 
 class MediaRejected(ValueError):
     """The input fails an editorial or technical requirement."""
+
+
+class MediaFramingRejected(MediaRejected):
+    """A candidate has no valid simultaneous facecam and gameplay framing."""
 
 
 def _number(value, label):
@@ -648,25 +655,117 @@ def _narration(editorial, metadata, temp):
     return audio, words, duration, voice_type
 
 
-def _layout(source, start, end, selected):
-    if selected not in {"auto", "blur", "react"}:
-        raise MediaRejected("layout must be auto, blur or react")
-    if selected == "blur":
-        return "blur", None
+def _crop_box(value, label):
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise MediaFramingRejected(f"{label} requires normalized x, y, width, and height")
+    try:
+        x, y, width, height = (_number(part, label) for part in value)
+    except MediaRejected as exc:
+        raise MediaFramingRejected(str(exc)) from exc
+    if not (0 <= x < x + width <= 1 and 0 <= y < y + height <= 1):
+        raise MediaFramingRejected(f"{label} is outside the source frame")
+    return x, y, width, height
+
+
+def _gameplay_box(camera, frame_ratio):
+    x, y, width, height = camera
+    gutter = 0.006
+    below, right = y + height + gutter, x + width + gutter
+    options = [(0, 0, x - gutter, 1), (right, 0, 1 - right, 1),
+               (0, 0, 1, y - gutter), (0, below, 1, 1 - below)]
+    options = [box for box in options if box[2] * box[3] >= 0.43 and box[2] >= 0.43 and box[3] >= 0.46
+               and 0.92 <= box[2] * frame_ratio / box[3] <= 3.5]
+    if not options:
+        raise MediaFramingRejected("No wide gameplay crop remains clear of the facecam")
+    return max(options, key=lambda box: box[2] * box[3] - abs(math.log(box[2] * frame_ratio / box[3] / 1.55)) * 0.14)
+
+
+def _pixel_crop(frame, box):
+    frame_height, frame_width = frame.shape[:2]
+    x, y, width, height = box
+    return frame[math.ceil(y * frame_height):math.floor((y + height) * frame_height),
+                 math.ceil(x * frame_width):math.floor((x + width) * frame_width)]
+
+
+def _output_panel(box, source_ratio, offset, height):
+    crop_ratio = box[2] * source_ratio / box[3]
+    width = min(OUTPUT_WIDTH, height * crop_ratio)
+    displayed_height = min(height, OUTPUT_WIDTH / crop_ratio)
+    return ((OUTPUT_WIDTH - width) / 2 / OUTPUT_WIDTH,
+            (offset + (height - displayed_height) / 2) / OUTPUT_HEIGHT,
+            width / OUTPUT_WIDTH, displayed_height / OUTPUT_HEIGHT)
+
+
+def _view_thumbnails(frames):
+    import cv2
+    import numpy as np
+
+    return [cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (112, 64),
+                       interpolation=cv2.INTER_AREA).astype(np.float32) for frame in frames]
+
+
+def _layout(source, start, end, editorial):
     if __package__:
-        from .facecam import find_cam
+        from . import facecam
     else:
-        from facecam import find_cam
+        import facecam
 
-    found = find_cam(str(source), start, end)
-    if found.get("mode") == "cam" and found.get("confidence", 0) >= 0.75:
-        x, y, width, height = found["box"]
-        if 0 <= x <= x + width <= 1 and 0 <= y <= y + height <= 1:
-            return "react", found["box"]
-    return "blur", None
+    if editorial.get("layout", "react") not in ("auto", "react"):
+        raise MediaFramingRejected("Every Short requires facecam above gameplay")
+    samples = facecam.sample_frames(str(source), start, end, n=9)
+    if len(samples) < 9 or any(frame.shape != samples[0].shape for frame in samples):
+        raise MediaFramingRejected("Could not verify both views across the entire clip")
+    source_height, source_width = samples[0].shape[:2]
+    source_ratio = source_width / source_height
+    face_hint = editorial.get("facecam_box")
+    if face_hint is None:
+        found = facecam.find_cam(str(source), start, end)
+        if found.get("mode") != "cam" or found.get("confidence", 0) < 0.85:
+            raise MediaFramingRejected("No stable, clearly bounded streamer facecam was found")
+        face_hint = found.get("box")
+    camera = _crop_box(face_hint, "Facecam crop")
+    gameplay = (_crop_box(editorial["gameplay_box"], "Gameplay crop") if editorial.get("gameplay_box") is not None
+                else _gameplay_box(camera, source_ratio))
+    cx, cy, cw, ch = camera
+    gx, gy, gw, gh = gameplay
+    if (min(cx + cw, gx + gw) > max(cx, gx) + 1e-9 and min(cy + ch, gy + gh) > max(cy, gy) + 1e-9):
+        raise MediaFramingRejected("Gameplay crop must exclude the facecam")
+    if gw * gh < 0.34 or not 0.92 <= gw * source_ratio / gh <= 3.5:
+        raise MediaFramingRejected("Gameplay crop does not retain a wide enough view of the source")
+
+    camera_frames = [_pixel_crop(frame, camera) for frame in samples]
+    game_frames = [_pixel_crop(frame, gameplay) for frame in samples]
+    cam_height, cam_width = camera_frames[0].shape[:2]
+    game_height, game_width = game_frames[0].shape[:2]
+    if cam_width < 90 or cam_height < 64 or game_width < 260 or game_height < 150:
+        raise MediaFramingRejected("Facecam or gameplay crop is too small for a readable stacked edit")
+    detections = facecam.detect_faces(camera_frames)
+    face, hits = facecam.stable_face(detections, len(samples))
+    if face is None or hits < 7 or not any(detections[:2]) or not any(detections[-2:]):
+        raise MediaFramingRejected("Streamer face is not visible in the facecam throughout this clip")
+
+    if sum(float(frame.std()) >= 7 for frame in _view_thumbnails(game_frames)) < 8:
+        raise MediaFramingRejected("The gameplay panel is blank or unreadable across the clip")
+
+    fx, fy, fw, fh = (float(part) for part in face)
+    if fx < 0 or fy < 0 or fw < 28 or fh < 28 or fx + fw > cam_width or fy + fh > cam_height:
+        raise MediaFramingRejected("Facecam crop cannot keep the streamer's entire face readable")
+    face_frames = [frame[int(fy):math.ceil(fy + fh), int(fx):math.ceil(fx + fw)] for frame in camera_frames]
+    face_thumbnails = _view_thumbnails(face_frames)
+    face_changes = sum(float(abs(previous - current).mean()) >= 1.3
+                       for previous, current in zip(face_thumbnails, face_thumbnails[1:]))
+    if face_changes < 2:
+        raise MediaFramingRejected("The source facecam does not show a moving streamer reaction")
+    face_box = (cx + cw * fx / cam_width, cy + ch * fy / cam_height, cw * fw / cam_width, ch * fh / cam_height)
+    panel = _output_panel(camera, source_ratio, 0, FACECAM_HEIGHT)
+    px, py, pw, ph = panel
+    face_on_output = (px + pw * fx / cam_width, py + ph * fy / cam_height, pw * fw / cam_width, ph * fh / cam_height)
+    return {"facecam_box": camera, "gameplay_box": gameplay, "face_box": face_box, "facecam_panel": panel,
+            "face_on_output": face_on_output, "gameplay_on_output": _output_panel(gameplay, source_ratio,
+                                                                                  FACECAM_HEIGHT, GAMEPLAY_HEIGHT)}
 
 
-def _captions(words, narration_words, start, end, voice_start, voice_end, hook, credit, layout):
+def _captions(words, narration_words, start, end, voice_start, voice_end, hook, credit):
     if __package__:
         from . import cut
     else:
@@ -678,7 +777,7 @@ def _captions(words, narration_words, start, end, voice_start, voice_end, hook, 
     merged = sorted(source_words + voice_words, key=lambda word: word["s"])
     if len(merged) < 14:
         raise MediaRejected("The clip requires timed spoken captions")
-    body = cut.build_ass(merged, start, end, hook, credit, 1320 if layout == "react" else 1260)
+    body = cut.build_ass(merged, start, end, hook, credit, 1320)
     body = body.replace("Style: Cap,Arial Black,92", "Style: Cap,Arial Black,64")
     body = body.replace("Style: Hook,Arial Black,68", "Style: Hook,Arial Black,56")
     body = body.replace("1,3,1,2,40,40,90,1", "1,3,1,7,78,74,92,1")
@@ -688,7 +787,7 @@ def _captions(words, narration_words, start, end, voice_start, voice_end, hook, 
     return body
 
 
-def _live_chat_overlay(subtitles, messages, duration, layout):
+def _live_chat_overlay(subtitles, messages, duration):
     if messages is None or messages == []:
         return subtitles, 0
     if not isinstance(messages, list) or len(messages) > 3:
@@ -713,7 +812,7 @@ def _live_chat_overlay(subtitles, messages, duration, layout):
             raise MediaRejected("Viewer-message time is outside the rendered Short")
         approved.append((start, end, text))
 
-    y = 705 if layout == "react" else 365
+    y = FACECAM_HEIGHT + 35
     events, label_spans = [], []
     lanes = [0.0, 0.0, 0.0]
     for start, end, text in sorted(approved, key=lambda item: item[0]):
@@ -740,23 +839,22 @@ def _paid_disclosure(subtitles):
             + r"Dialogue: 4,0:00:00.00,0:00:02.00,PaidDisclosure,,0,0,0,,{\pos(926,95)}Paid clipping campaign" + "\n")
 
 
-def _visual_filter(layout, camera):
-    # Preserve the full source frame. Reuse the clip desk's split framing when a webcam is visible.
-    if layout == "react":
-        x, y, width, height = camera
-        return (
-            f"[0:v]split[a][b];[a]crop=iw*{width}:ih*{height}:iw*{x}:ih*{y},"
-            "scale=1080:670:force_original_aspect_ratio=increase,crop=1080:670,setsar=1[cam];"
-            "[b]scale=1080:1250:force_original_aspect_ratio=decrease:force_divisible_by=2,"
-            "pad=1080:1250:(ow-iw)/2:(oh-ih)/2:color=0x0b0f18,setsar=1[game];"
-            "[cam][game]vstack,fps=30,subtitles='captions.ass'[video]"
-        )
-    return (
-        "[0:v]split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
-        "boxblur=26:2,eq=brightness=-0.14,setsar=1[bg];"
-        "[b]scale=1080:1640:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1[fg];"
-        "[bg][fg]overlay=(W-w)/2:(H-h)/2-90,fps=30,subtitles='captions.ass'[video]"
-    )
+def _pane(source, output, box, pane_height):
+    x, y, width, height = box
+    left = f"ceil(iw*{x:.10f}/2)*2"
+    top = f"ceil(ih*{y:.10f}/2)*2"
+    cropped_width = f"floor(iw*{x + width:.10f}/2)*2-{left}"
+    cropped_height = f"floor(ih*{y + height:.10f}/2)*2-{top}"
+    return (f"[{source}]crop={cropped_width}:{cropped_height}:{left}:{top}:exact=1,"
+            f"scale={OUTPUT_WIDTH}:{pane_height}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            f"pad={OUTPUT_WIDTH}:{pane_height}:(ow-iw)/2:(oh-ih)/2:color=0x0b0f18,setsar=1[{output}];")
+
+
+def _visual_filter(framing):
+    return ("[0:v]split[a][b];"
+            + _pane("a", "cam", framing["facecam_box"], FACECAM_HEIGHT)
+            + _pane("b", "game", framing["gameplay_box"], GAMEPLAY_HEIGHT)
+            + "[cam][game]vstack,fps=30,subtitles='captions.ass'[video]")
 
 
 @lru_cache(maxsize=1)
@@ -770,7 +868,7 @@ def nvenc_available():
         return False
 
 
-def _encode(source, audio, start, duration, voice_start, voice_end, layout, camera, temp):
+def _encode(source, audio, start, duration, voice_start, voice_end, framing, temp):
     audio_filter = (
         "[0:a:0]aresample=48000,asetpts=PTS-STARTPTS,"
         f"volume=0.22:enable='between(t,{voice_start:.3f},{voice_end:.3f})'[source];"
@@ -780,7 +878,7 @@ def _encode(source, audio, start, duration, voice_start, voice_end, layout, came
     )
     arguments = [_tool("ffmpeg"), "-nostdin", "-y", "-v", "error", "-threads", "4", "-ss", f"{start:.3f}",
                  *_media_input(source), *_media_input(audio), "-t", f"{duration:.3f}", "-filter_complex_threads", "4",
-                 "-filter_complex", _visual_filter(layout, camera) + ";" + audio_filter,
+                 "-filter_complex", _visual_filter(framing) + ";" + audio_filter,
                  "-map", "[video]", "-map", "[audio]", "-map_metadata", "-1", "-map_chapters", "-1"]
     software = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-threads:v", "4"]
     hardware = ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq", "-rc", "vbr", "-cq", "20", "-b:v", "0"]
@@ -835,7 +933,7 @@ def validate_short(path, *, minimum=7, maximum=30):
 
 
 def produce(source, candidate, editorial, output, *, creator, source_url, minimum=7, maximum=30):
-    """Render original narration and captions over a cleared candidate and validate the MP4."""
+    """Render cleared simultaneous facecam and gameplay with narration, then validate the MP4."""
     began = time.perf_counter()
     minimum, maximum = _duration_limits(minimum, maximum)
     source = _file(source, VIDEO_SUFFIXES, "Source")
@@ -848,7 +946,7 @@ def produce(source, candidate, editorial, output, *, creator, source_url, minimu
     if not 0 <= start < end <= _duration(_probe(source)) + 1e-7 or not minimum - 1e-7 <= duration <= maximum + 1e-7:
         raise MediaRejected("Candidate is outside source or configured clip bounds")
     metadata = _metadata(editorial, candidate, creator, source_url)
-    layout, camera = _layout(source, start, end, editorial.get("layout", "auto"))
+    framing = _layout(source, start, end, editorial)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="shorts-render-", dir=output.parent) as folder:
         temp = Path(folder)
@@ -860,21 +958,22 @@ def produce(source, candidate, editorial, output, *, creator, source_url, minimu
         if not 0 <= voice_start <= 5 or not 3 <= voice_duration <= duration * 0.85 or voice_end > duration - 0.75:
             raise MediaRejected("Narration must fit inside the clip and leave a source payoff")
         captions = _captions(candidate.get("words", []), voice_words, start, end, voice_start, voice_end,
-                             metadata["hook"], metadata["credit"], layout)
-        captions, chat_count = _live_chat_overlay(captions, editorial.get("viewer_messages"), duration, layout)
+                             metadata["hook"], metadata["credit"])
+        captions, chat_count = _live_chat_overlay(captions, editorial.get("viewer_messages"), duration)
         paid_disclosure = editorial.get("paid_campaign") is True
         if paid_disclosure:
             captions = _paid_disclosure(captions)
         (temp / "captions.ass").write_text(captions, encoding="utf-8")
-        final, encoder = _encode(source, audio, start, duration, voice_start, voice_end, layout, camera, temp)
+        final, encoder = _encode(source, audio, start, duration, voice_start, voice_end, framing, temp)
         quality = validate_short(final, minimum=minimum, maximum=maximum)
         if voice_type == "synthetic":
             metadata["description"] = metadata["description"].replace(
                 "Original analysis by The Vibe.", "Original analysis and synthetic narration by The Vibe.")
-        metadata.update({"file": str(output), "start": start, "end": end, "layout": layout, "encoder": encoder,
+        metadata.update({"file": str(output), "start": start, "end": end, "layout": "react", "encoder": encoder,
                          "narration_type": voice_type, "duration": quality["duration"], "sha256": quality["sha256"],
                          "quality": quality, "production_seconds": round(time.perf_counter() - began, 2),
                          "viewer_messages_shown": chat_count, "paid_campaign_disclosure_shown": paid_disclosure})
+        metadata.update(framing)
         sidecar = temp / "short.json"
         sidecar.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         final.replace(output)

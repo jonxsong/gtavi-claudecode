@@ -42,10 +42,15 @@ class ShortsEngineTests(unittest.TestCase):
         feed(self.state, {})
         output = self.root / "edits" / f"{job_id}.mp4"
         output.write_bytes(b"synthetic example for uploader mock")
+        cover = output.with_suffix(".cover.jpg")
+        cover.write_bytes(b"synthetic cover for uploader mock")
         with self.state.connect() as db:
             self.state.update(db, job_id, "ready", candidate='{"score": 95}', output_digest=sha256(output),
                               metadata=json.dumps({"title": "Fixture", "description": "Source and commentary",
-                                                   "duration": duration}))
+                                                   "duration": duration, "layout": "react",
+                                                   "face_on_output": [0.3, 0.1, 0.3, 0.2],
+                                                   "gameplay_on_output": [0.0, 0.4, 1.0, 0.6],
+                                                   "thumbnail": {"sha256": sha256(cover)}}))
 
     def get(self, job_id):
         with self.state.connect() as db:
@@ -84,6 +89,35 @@ class ShortsEngineTests(unittest.TestCase):
         youtube.start_upload.assert_called_once()
         self.assertIn("#xQc #GTA6 #GTAVI #TwitchClips", youtube.start_upload.call_args.kwargs["description"])
         youtube.resume_upload.assert_called_once()
+        youtube.set_shorts_thumbnail.assert_called_once()
+        methods = [call[0] for call in youtube.mock_calls]
+        self.assertLess(methods.index("set_shorts_thumbnail"), methods.index("publish"))
+
+    def test_thumbnail_failure_keeps_short_private(self):
+        self.rights({"license": self.grant})
+        self.queue("first")
+        youtube = Mock()
+        youtube.recent_uploads.return_value = []
+        youtube.start_upload.return_value = "example-session"
+        youtube.resume_upload.return_value = "abcdefghijk"
+        youtube.set_shorts_thumbnail.side_effect = YouTubeRetryable("waiting for portrait cover")
+
+        publish_jobs(self.state, youtube)
+
+        self.assertEqual(self.get("first")["state"], "private")
+        youtube.publish.assert_not_called()
+
+    def test_legacy_ready_edit_is_rendered_again_instead_of_uploaded(self):
+        self.rights({"license": self.grant})
+        self.queue("first")
+        with self.state.connect() as db:
+            self.state.update(db, "first", "ready", metadata='{"duration": 20, "layout": "blur"}')
+        youtube = Mock()
+
+        publish_jobs(self.state, youtube)
+
+        self.assertEqual(self.get("first")["state"], "queued")
+        youtube.start_upload.assert_not_called()
 
     def test_kill_and_changed_manifest_stop_external_mutation(self):
         self.rights({"license": self.grant})

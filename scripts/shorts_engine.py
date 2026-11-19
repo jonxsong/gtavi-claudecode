@@ -223,7 +223,8 @@ def is_duplicate(db, manifest, candidate, job_id, compare):
 
 
 def prepare(state, job):
-    from engine_media import MediaError, MediaRejected, analyze, near_duplicate, produce
+    from engine_media import MediaError, MediaFramingRejected, MediaRejected, analyze, near_duplicate, produce
+    from engine_thumbnail import ThumbnailError, ThumbnailRejected, render_thumbnail
 
     began = time.monotonic()
     job_id = job["id"]
@@ -248,6 +249,7 @@ def prepare(state, job):
                                       "candidates_70_plus": [{key: candidate[key] for key in
                                                               ("start", "end", "score", "window_index")}
                                                              for candidate in candidates if candidate["score"] >= 70]})
+        framing_rejection = None
         for candidate in candidates:
             index = candidate["window_index"]
             if index is None or candidate["score"] < config["threshold"]:
@@ -278,6 +280,10 @@ def prepare(state, job):
             try:
                 metadata = produce(source, candidate, editorial, output, creator=manifest["creator"], source_url=source_url,
                                    minimum=MIN_SECONDS, maximum=MAX_SECONDS)
+            except MediaFramingRejected as error:
+                framing_rejection = str(error)
+                log_event("framing_rejected", job=job_id, window=index, reason=framing_rejection)
+                continue
             except MediaRejected as error:
                 log_event("render_rejected", job=job_id, window=index, reason=str(error))
                 continue
@@ -292,6 +298,15 @@ def prepare(state, job):
                 log_event("chat_overlay_rejected", job=job_id, window=index)
                 continue
             metadata["viewer_messages_included"] = len(messages)
+            try:
+                metadata["thumbnail"] = render_thumbnail(
+                    output, {**metadata, "peak": candidate.get("peak"), "words": candidate.get("words", [])},
+                    output.with_suffix(".cover.jpg"),
+                )
+            except ThumbnailRejected as error:
+                framing_rejection = str(error)
+                log_event("thumbnail_rejected", job=job_id, window=index, reason=framing_rejection)
+                continue
             if sha256(source) != source_digest:
                 raise Rejected("source file changed during analysis or rendering")
             metadata["source_sha256"] = source_digest
@@ -315,6 +330,8 @@ def prepare(state, job):
                              metadata=json_text(metadata), attempts=0)
             log_event("edit_ready", job=job_id, score=candidate["score"], seconds=metadata["latency_seconds"], stage=stage)
             return
+        if framing_rejection:
+            raise Rejected(framing_rejection)
         raise Rejected("no publishable, nonduplicative editorial window reached the score threshold")
     except Blocked as error:
         state.retry(job, "blocked", str(error), delay=60)
@@ -324,7 +341,7 @@ def prepare(state, job):
     except (Rejected, MediaRejected, ValueError, TypeError, KeyError) as error:
         with state.connect() as db:
             state.update(db, job_id, "rejected", str(error)[:240])
-    except (MediaError, OSError, SystemExit) as error:
+    except (MediaError, ThumbnailError, OSError, SystemExit) as error:
         state.retry(job, "queued", "media tooling or source is unavailable: " + type(error).__name__)
 
 
@@ -381,6 +398,18 @@ def publish_jobs(state, youtube):
                     with state.connect() as db:
                         state.update(db, job_id, "published", published=published, session_url=None)
                     continue
+            thumbnail = metadata.get("thumbnail") or {}
+            if (metadata.get("layout") != "react" or not metadata.get("face_on_output")
+                    or not metadata.get("gameplay_on_output") or not thumbnail.get("sha256")):
+                if stage == "ready" and not session and not video_id:
+                    with state.connect() as db:
+                        state.update(db, job_id, "queued", "rebuilding with facecam, gameplay and a custom cover",
+                                     candidate=None, output_digest=None, metadata=None, attempts=0, reserved_day=None)
+                    continue
+                raise Blocked("a stacked edit and its custom cover are required before publication")
+            cover = output.with_suffix(".cover.jpg")
+            if not cover.is_file() or cover.is_symlink() or sha256(cover) != thumbnail["sha256"]:
+                raise Rejected("prepared custom cover is missing or was modified")
             reserve(state, job, config)
             if not session and not video_id:
                 add_upload_hashtags(metadata, manifest["creator"], None, metadata.get("clip_category"))
@@ -403,6 +432,12 @@ def publish_jobs(state, youtube):
                 stage = "private"
                 with state.connect() as db:
                     state.update(db, job_id, stage, video_id=video_id, session_url=None, attempts=0)
+            if thumbnail.get("applied_video_id") != video_id:
+                youtube.set_shorts_thumbnail(video_id, cover, guard=guard)
+                thumbnail["applied_video_id"] = video_id
+                with state.connect() as db:
+                    state.update(db, job_id, stage, metadata=json_text(metadata), attempts=0)
+                log_event("thumbnail_applied", job=job_id, video_id=video_id)
             video = youtube.publish(video_id, paid_promotion=False, guard=guard)
             published = video.get("snippet", {}).get("publishedAt") or now().isoformat()
             with state.connect() as db:

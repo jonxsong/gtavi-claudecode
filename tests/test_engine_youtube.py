@@ -21,6 +21,8 @@ import engine_youtube as youtube
 SESSION = youtube.UPLOAD_API + "?uploadType=resumable&upload_id=test"
 VIDEO_ID = "QxXVMysHN6s"
 CHANNEL = {"id": youtube.CHANNEL_ID, "contentDetails": {"relatedPlaylists": {"uploads": "uploads-id"}}}
+THUMBNAIL = {"url": "https://i.ytimg.com/vi/test/portrait.jpg", "width": 608, "height": 1080}
+PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a/wAAAABJRU5ErkJggg==")
 
 
 def response(status=200, payload=None, headers=None):
@@ -137,6 +139,57 @@ class YouTubeTest(unittest.TestCase):
         with self.assertRaises(youtube.YouTubeUploadStopped):
             self.client.publish(VIDEO_ID, guard=lambda: next(allowed))
         self.assertEqual([call[0] for call in self.calls], ["GET", "GET"])
+
+    def test_sets_portrait_thumbnail_for_processed_owner_short(self):
+        cover = self.file.with_suffix(".png")
+        cover.write_bytes(PNG)
+        self.replies.extend([
+            response(payload={"items": [CHANNEL]}),
+            response(payload={"items": [private_upload()]}),
+            response(payload={"items": [{"shortsAspectRatio": THUMBNAIL}]}),
+        ])
+        self.assertEqual(self.client.set_shorts_thumbnail(VIDEO_ID, cover), THUMBNAIL)
+        method, url, request = self.calls[-1]
+        self.assertEqual((method, url), ("POST", youtube.THUMBNAIL_API))
+        self.assertEqual(request["params"], {"videoId": VIDEO_ID, "uploadType": "media"})
+        self.assertEqual(request["headers"]["Content-Type"], "image/png")
+        self.assertEqual(request["data"], PNG)
+
+    def test_thumbnail_skips_unprocessed_short_wrong_owner_and_revoked_guard(self):
+        wrong_owner = private_upload()
+        wrong_owner["snippet"]["channelId"] = "UC-other"
+        cover = self.file.with_suffix(".png")
+        cover.write_bytes(PNG)
+        self.replies.extend([
+            response(payload={"items": [CHANNEL]}),
+            response(payload={"items": [private_upload(processed=False)]}),
+            response(payload={"items": [wrong_owner]}),
+            response(payload={"items": [private_upload()]}),
+        ])
+        with self.assertRaises(youtube.YouTubeProcessing):
+            self.client.set_shorts_thumbnail(VIDEO_ID, cover)
+        with self.assertRaisesRegex(youtube.YouTubeError, "does not belong"):
+            self.client.set_shorts_thumbnail(VIDEO_ID, cover)
+        allowed = iter([True, False])
+        with self.assertRaises(youtube.YouTubeUploadStopped):
+            self.client.set_shorts_thumbnail(VIDEO_ID, cover, guard=lambda: next(allowed))
+        self.assertTrue(all(call[0] == "GET" for call in self.calls))
+
+    def test_thumbnail_requires_portrait_confirmation_and_honors_rate_limit(self):
+        cover = self.file.with_suffix(".png")
+        cover.write_bytes(PNG)
+        self.replies.extend([
+            response(payload={"items": [CHANNEL]}),
+            response(payload={"items": [private_upload()]}),
+            response(payload={"items": [{"shortsAspectRatio": {**THUMBNAIL, "width": 1280, "height": 720}}]}),
+            response(payload={"items": [private_upload()]}),
+            response(429, {"error": {"errors": [{"reason": "uploadRateLimitExceeded"}]}}, {"Retry-After": "600"}),
+        ])
+        with self.assertRaisesRegex(youtube.YouTubeRetryable, "did not confirm"):
+            self.client.set_shorts_thumbnail(VIDEO_ID, cover)
+        with self.assertRaises(youtube.YouTubeRetryable) as limited:
+            self.client.set_shorts_thumbnail(VIDEO_ID, cover)
+        self.assertEqual(limited.exception.retry_after, 600)
 
     def test_analytics_keeps_missing_revenue_distinct_from_zero(self):
         self.replies.extend([

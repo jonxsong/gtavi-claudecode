@@ -27,6 +27,7 @@ CHANNEL_HANDLE = "@GTA-Vibing"
 CHANNEL_ID = "UCAtLKFamARYmLeTcwzA3akw"
 DATA_API = "https://www.googleapis.com/youtube/v3"
 UPLOAD_API = "https://www.googleapis.com/upload/youtube/v3/videos"
+THUMBNAIL_API = "https://www.googleapis.com/upload/youtube/v3/thumbnails/set"
 ANALYTICS_API = "https://youtubeanalytics.googleapis.com/v2/reports"
 TOKEN_API = "https://oauth2.googleapis.com/token"
 REVOKE_API = "https://oauth2.googleapis.com/revoke"
@@ -36,12 +37,15 @@ REQUIRED_SCOPES = tuple(SCOPE_PREFIX + scope for scope in ("youtube", "youtube.r
 SCOPES = (*REQUIRED_SCOPES, SCOPE_PREFIX + "yt-analytics-monetary.readonly")
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 CHUNK_SIZE = 8 * 1024 * 1024  # Non-final chunks are multiples of 256 KiB.
+THUMBNAIL_LIMIT = 50_000_000
+THUMBNAIL_TYPES = {".jpg": ("image/jpeg", b"\xff\xd8\xff"), ".jpeg": ("image/jpeg", b"\xff\xd8\xff"),
+                   ".png": ("image/png", b"\x89PNG\r\n\x1a\n")}
 ACTIVITY_METRICS = (
     "views", "engagedViews", "averageViewDuration", "averageViewPercentage",
     "shares", "likes", "comments", "subscribersGained", "subscribersLost",
 )
 RETRY_REASONS = {"rateLimitExceeded", "userRateLimitExceeded", "backendError"}
-QUOTA_REASONS = {"quotaExceeded", "dailyLimitExceeded", "uploadLimitExceeded"}
+QUOTA_REASONS = {"quotaExceeded", "dailyLimitExceeded", "uploadLimitExceeded", "uploadRateLimitExceeded"}
 
 
 class YouTubeError(RuntimeError):
@@ -262,6 +266,17 @@ def _timestamp(value):
     if not isinstance(value, datetime) or value.utcoffset() is None:
         raise ValueError("Use a timezone-aware publication time.")
     return value.astimezone(timezone.utc).replace(microsecond=0)
+
+
+def _require_processed_upload(video):
+    status = video.get("status", {})
+    processed = video.get("processingDetails", {}).get("processingStatus")
+    upload_status = status.get("uploadStatus")
+    if (upload_status in {"failed", "rejected", "deleted"} or processed in {"failed", "terminated"}
+            or status.get("rejectionReason") or status.get("failureReason")):
+        raise YouTubeError("YouTube rejected the upload or failed processing it.")
+    if processed != "succeeded" or upload_status != "processed":
+        raise YouTubeProcessing("YouTube has not finished processing the upload.")
 
 
 class YouTube:
@@ -515,6 +530,44 @@ class YouTube:
             raise YouTubeError("The video does not belong to GTA VIBING.")
         return items[0]
 
+    def set_shorts_thumbnail(self, video_id, path, *, guard=None):
+        """Set the cover on a processed Short and return its confirmed portrait thumbnail."""
+        _run_guard(guard)
+        _require_processed_upload(self.video(video_id))
+        path = Path(path)
+        format_info = THUMBNAIL_TYPES.get(path.suffix.lower())
+        if format_info is None:
+            raise YouTubeError("YouTube Shorts thumbnails must be JPEG or PNG images.")
+        mime_type, signature = format_info
+        with path.open("rb") as image:
+            data = image.read(THUMBNAIL_LIMIT + 1)
+        if not data.startswith(signature) or len(data) > THUMBNAIL_LIMIT:
+            raise YouTubeError("Use a valid JPEG or PNG thumbnail that is at most 50 MB.")
+        response = self._request(
+            "POST", THUMBNAIL_API, params={"videoId": video_id, "uploadType": "media"},
+            data=data, headers={"Content-Type": mime_type}, guard=guard, attempts=1,
+        )
+        try:
+            items = _response_json(response).get("items")
+        except YouTubeError:
+            raise YouTubeRetryable("YouTube did not return a thumbnail confirmation.") from None
+        if not isinstance(items, list):
+            raise YouTubeRetryable("YouTube did not return a thumbnail confirmation.")
+        for item in items:
+            thumbnail = item.get("shortsAspectRatio") if isinstance(item, dict) else None
+            if not isinstance(thumbnail, dict):
+                continue
+            url = thumbnail.get("url", "")
+            if not isinstance(url, str) or not url.startswith("https://"):
+                continue
+            width, height = thumbnail.get("width"), thumbnail.get("height")
+            if width is not None and height is not None:
+                if (type(width) is not int or type(height) is not int or min(width, height) <= 0
+                        or abs(width - height * 9 / 16) > 1):
+                    continue
+            return thumbnail
+        raise YouTubeRetryable("YouTube did not confirm the 9:16 Shorts thumbnail.")
+
     def publish(self, video_id, *, publish_at=None, paid_promotion=None, guard=None):
         """Promote a successfully processed private video to public or schedule it."""
         _run_guard(guard)
@@ -537,13 +590,7 @@ class YouTube:
             raise YouTubeError("The private video already has a different publication schedule.")
         if target is not None and target <= now:
             raise YouTubeError("The scheduled publication time must still be in the future.")
-        processed = current.get("processingDetails", {}).get("processingStatus")
-        upload_status = status.get("uploadStatus")
-        if (upload_status in {"failed", "rejected", "deleted"} or processed in {"failed", "terminated"}
-                or status.get("rejectionReason") or status.get("failureReason")):
-            raise YouTubeError("YouTube rejected the private upload or failed processing it.")
-        if processed != "succeeded" or upload_status != "processed":
-            raise YouTubeProcessing("YouTube has not finished processing the private upload.")
+        _require_processed_upload(current)
         if current.get("contentDetails", {}).get("contentRating", {}).get("ytRating") == "ytAgeRestricted":
             raise YouTubeError("YouTube has age-restricted this private upload.")
         body = {key: status[key] for key in ("license", "embeddable", "publicStatsViewable",
