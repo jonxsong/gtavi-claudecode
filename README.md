@@ -15,6 +15,8 @@
 
 </div>
 
+For the GTA VIBING Windows service, see the [unattended Shorts runbook](docs/shorts-engine.md) and [skill audit](docs/shorts-engine-audit.md). It monitors five specified Twitch channels and publishes eligible 7–30 second GTA VI moments to `@GTA-Vibing`.
+
 ```
 /plugin marketplace add Bodila51/gtavi-claudecode
 /plugin install gtavi-claudecode@gtavi-claudecode
