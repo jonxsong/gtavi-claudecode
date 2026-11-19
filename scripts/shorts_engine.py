@@ -30,6 +30,7 @@ DEFAULT_ROOT = Path(__file__).resolve().parents[1] / ".shorts-engine"
 GIB = 1024 ** 3
 MIN_SECONDS = 7
 MAX_SECONDS = 30
+YOUTUBE_TITLE_LIMIT = 100
 CREATOR_HASHTAGS = {
     "ishowspeed": "#IShowSpeed", "kaicenat": "#KaiCenat", "jasontheween": "#JasonTheWeen",
     "moistcr1tikal": "#moistcr1tikal", "xqc": "#xQc",
@@ -146,6 +147,42 @@ def add_upload_hashtags(metadata, creator, campaign, category):
     if campaign:
         description = f"Paid clipping campaign.\n\n{description}"
     metadata.update(description=f"{description}\n\n{' '.join(tags)}", hashtags=tags, tags=[tag[1:] for tag in tags])
+
+
+def format_upload_title(title, creator):
+    """Use one canonical creator hashtag before the clip title."""
+    hashtag = CREATOR_HASHTAGS[creator]
+    if not isinstance(title, str):
+        raise Rejected("A clip title is required")
+    tag = re.escape(hashtag)
+    body = re.sub(rf"^(?:{tag}(?!\w)[:|–—-]?\s*)+", "", title.strip(), flags=re.IGNORECASE)
+    body = re.sub(rf"(?<![\w#]){tag}(?!\w)", "", body, flags=re.IGNORECASE)
+    body = " ".join(body.split())
+    if not body:
+        raise Rejected("A clip title is required after the streamer hashtag")
+    budget = YOUTUBE_TITLE_LIMIT - len(hashtag) - 1
+    if len(body) > budget:
+        clipped = body[:budget - 1].rstrip()
+        boundary = clipped.rfind(" ")
+        if not body[budget - 1].isspace() and boundary >= budget * 0.75:
+            clipped = clipped[:boundary]
+        body = f"{clipped}…"
+    return f"{hashtag} {body}"
+
+
+def existing_upload_title(youtube, title, creator, *, excluding=None):
+    if not hasattr(youtube, "recent_uploads"):
+        return False
+    for post in youtube.recent_uploads(limit=50):
+        if excluding and post.get("video_id") == excluding:
+            continue
+        try:
+            current = format_upload_title(post.get("title"), creator)
+        except Rejected:
+            continue
+        if title.casefold() == current.casefold():
+            return True
+    return False
 
 
 def get_source(state, job, manifest, grant):
@@ -310,6 +347,7 @@ def prepare(state, job):
             if sha256(source) != source_digest:
                 raise Rejected("source file changed during analysis or rendering")
             metadata["source_sha256"] = source_digest
+            metadata["title"] = format_upload_title(metadata["title"], manifest["creator"])
             add_upload_hashtags(metadata, manifest["creator"], manifest.get("campaign_id"), editorial.get("clip_category"))
             for key in ("hook_style", "clip_category", "narrative_structure", "commentary_format"):
                 if isinstance(editorial.get(key), str):
@@ -410,38 +448,45 @@ def publish_jobs(state, youtube):
             cover = output.with_suffix(".cover.jpg")
             if not cover.is_file() or cover.is_symlink() or sha256(cover) != thumbnail["sha256"]:
                 raise Rejected("prepared custom cover is missing or was modified")
+            creator = manifest["creator"]
+            previous_title = metadata["title"]
+            title = format_upload_title(previous_title, creator)
+            metadata["title"] = title
+            already_started = bool(session or video_id)
             reserve(state, job, config)
-            if not session and not video_id:
-                add_upload_hashtags(metadata, manifest["creator"], None, metadata.get("clip_category"))
-                if hasattr(youtube, "recent_uploads") and any(
-                    post["title"].casefold().strip() == metadata["title"].casefold().strip()
-                    for post in youtube.recent_uploads(limit=50)
-                ):
+            if not already_started:
+                add_upload_hashtags(metadata, creator, None, metadata.get("clip_category"))
+                if existing_upload_title(youtube, title, creator):
                     with state.connect() as db:
                         state.update(db, job_id, "rejected", "an existing channel upload uses this title")
                     continue
-                session = youtube.start_upload(output, title=metadata["title"], description=metadata["description"],
+                session = youtube.start_upload(output, title=title, description=metadata["description"],
                                                tags=metadata.get("tags", ()),
                                                contains_synthetic_media=manifest.get("realistic_synthetic_media") is True,
                                                guard=guard)
                 stage = "uploading"
                 with state.connect() as db:
-                    state.update(db, job_id, stage, session_url=session)
+                    state.update(db, job_id, stage, session_url=session, metadata=json_text(metadata))
             if not video_id:
                 video_id = youtube.resume_upload(session, output, guard=guard)
                 stage = "private"
                 with state.connect() as db:
                     state.update(db, job_id, stage, video_id=video_id, session_url=None, attempts=0)
+            if already_started and title != previous_title and existing_upload_title(youtube, title, creator,
+                                                                                      excluding=video_id):
+                with state.connect() as db:
+                    state.update(db, job_id, "rejected", "an existing channel upload uses this title")
+                continue
             if thumbnail.get("applied_video_id") != video_id:
                 youtube.set_shorts_thumbnail(video_id, cover, guard=guard)
                 thumbnail["applied_video_id"] = video_id
                 with state.connect() as db:
                     state.update(db, job_id, stage, metadata=json_text(metadata), attempts=0)
                 log_event("thumbnail_applied", job=job_id, video_id=video_id)
-            video = youtube.publish(video_id, paid_promotion=False, guard=guard)
+            video = youtube.publish(video_id, title=title, paid_promotion=False, guard=guard)
             published = video.get("snippet", {}).get("publishedAt") or now().isoformat()
             with state.connect() as db:
-                state.update(db, job_id, "published", published=published, attempts=0)
+                state.update(db, job_id, "published", published=published, metadata=json_text(metadata), attempts=0)
             log_event("published", job=job_id, video_id=video_id)
         except Blocked as error:
             state.retry(job, stage, str(error), delay=60)

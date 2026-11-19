@@ -568,12 +568,17 @@ class YouTube:
             return thumbnail
         raise YouTubeRetryable("YouTube did not confirm the 9:16 Shorts thumbnail.")
 
-    def publish(self, video_id, *, publish_at=None, paid_promotion=None, guard=None):
-        """Promote a successfully processed private video to public or schedule it."""
+    def publish(self, video_id, *, publish_at=None, paid_promotion=None, title=None, guard=None):
+        """Promote a processed private video, optionally correcting its title at the same time."""
         _run_guard(guard)
+        if title is not None and (not isinstance(title, str) or not title.strip() or len(title) > 100
+                                  or any(char in title for char in "<>")):
+            raise YouTubeError("Use a title of 1–100 characters without angle brackets.")
         target = _timestamp(publish_at) if publish_at is not None else None
         current = self.video(video_id)
         status = current.get("status", {})
+        snippet = current.get("snippet", {})
+        change_title = title is not None and snippet.get("title") != title
         privacy = status.get("privacyStatus")
         scheduled = _timestamp(status["publishAt"]) if status.get("publishAt") else None
         now = datetime.now(timezone.utc)
@@ -585,9 +590,10 @@ class YouTube:
         if privacy != "private":
             raise YouTubeError("YouTube publication requires an existing private upload.")
         if scheduled is not None:
-            if target == scheduled:
+            if target != scheduled:
+                raise YouTubeError("The private video already has a different publication schedule.")
+            if not change_title:
                 return current
-            raise YouTubeError("The private video already has a different publication schedule.")
         if target is not None and target <= now:
             raise YouTubeError("The scheduled publication time must still be in the future.")
         _require_processed_upload(current)
@@ -598,6 +604,16 @@ class YouTube:
         body["privacyStatus"] = "private" if target else "public"
         if target:
             body["publishAt"] = target.isoformat().replace("+00:00", "Z")
+        sections = {"status": body}
+        headers = {}
+        if change_title:
+            if not snippet.get("categoryId"):
+                raise YouTubeRetryable("YouTube has not returned the video category needed to correct its title.")
+            editable_fields = ("categoryId", "defaultLanguage", "description", "tags")
+            sections["snippet"] = {key: snippet[key] for key in editable_fields if key in snippet}
+            sections["snippet"]["title"] = title
+            if current.get("etag"):
+                headers["If-Match"] = current["etag"]
 
         def publication_guard():
             _run_guard(guard)
@@ -605,8 +621,8 @@ class YouTube:
                 raise YouTubeError("The scheduled publication time must still be in the future.")
 
         result = _response_json(self._request(
-            "PUT", DATA_API + "/videos", params={"part": "status"},
-            json={"id": video_id, "status": body}, guard=publication_guard, attempts=1,
+            "PUT", DATA_API + "/videos", params={"part": ",".join(sections)}, headers=headers,
+            json={"id": video_id, **sections}, guard=publication_guard, attempts=1,
         ))
         changed = result.get("status", {})
         try:
@@ -614,14 +630,15 @@ class YouTube:
         except ValueError:
             confirmed_time = None
         if (result.get("id") != video_id or changed.get("privacyStatus") != body["privacyStatus"]
-                or confirmed_time != target):
+                or confirmed_time != target or (change_title and result.get("snippet", {}).get("title") != title)):
             raise YouTubeRetryable("YouTube has not confirmed the requested publication state.")
         if target is None:
             public = self.video(video_id)
-            if public.get("status", {}).get("privacyStatus") != "public":
+            if (public.get("status", {}).get("privacyStatus") != "public"
+                    or (title is not None and public.get("snippet", {}).get("title") != title)):
                 raise YouTubeRetryable("The updated video is not publicly visible yet.")
             return public
-        return {**current, "status": changed}
+        return {**current, "status": changed, "snippet": result.get("snippet", snippet)}
 
     def _report(self, params, metrics, *, dimensions=None):
         query = {**params, "metrics": ",".join(metrics)}

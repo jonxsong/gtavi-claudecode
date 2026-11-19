@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from engine_rights import CAMPAIGNS, CHANNEL_ID, Blocked, authorize, cleared_viewer_messages
 from engine_state import State, now, sha256
 from engine_youtube import YouTubeRetryable
-from shorts_engine import add_upload_hashtags, aligned_chat, feed, get_source, publish_jobs, reserve
+from shorts_engine import add_upload_hashtags, aligned_chat, feed, format_upload_title, get_source, publish_jobs, reserve
 
 
 class ShortsEngineTests(unittest.TestCase):
@@ -87,11 +87,43 @@ class ShortsEngineTests(unittest.TestCase):
         publish_jobs(self.state, youtube)
         self.assertEqual(self.get("first")["state"], "published")
         youtube.start_upload.assert_called_once()
+        self.assertEqual(youtube.start_upload.call_args.kwargs["title"], "#xQc Fixture")
+        self.assertEqual(json.loads(self.get("first")["metadata"])["title"], "#xQc Fixture")
         self.assertIn("#xQc #GTA6 #GTAVI #TwitchClips", youtube.start_upload.call_args.kwargs["description"])
         youtube.resume_upload.assert_called_once()
         youtube.set_shorts_thumbnail.assert_called_once()
         methods = [call[0] for call in youtube.mock_calls]
         self.assertLess(methods.index("set_shorts_thumbnail"), methods.index("publish"))
+
+    def test_old_unprefixed_channel_upload_is_still_a_duplicate(self):
+        self.rights({"license": self.grant})
+        self.queue("first")
+        youtube = Mock()
+        youtube.recent_uploads.return_value = [{"video_id": "existing_id", "title": " fixture "}]
+
+        publish_jobs(self.state, youtube)
+
+        self.assertEqual(self.get("first")["state"], "rejected")
+        self.assertIn("existing channel upload", self.get("first")["reason"])
+        youtube.start_upload.assert_not_called()
+
+    def test_legacy_session_reuses_its_video_and_updates_the_title_at_promotion(self):
+        self.rights({"license": self.grant})
+        self.queue("first")
+        with self.state.connect() as db:
+            self.state.update(db, "first", "uploading", session_url="existing-session")
+        youtube = Mock()
+        youtube.recent_uploads.return_value = [{"video_id": "abcdefghijk", "title": "Fixture"}]
+        youtube.resume_upload.return_value = "abcdefghijk"
+        youtube.publish.return_value = {"snippet": {"publishedAt": now().isoformat()}}
+
+        publish_jobs(self.state, youtube)
+
+        self.assertEqual(self.get("first")["state"], "published")
+        youtube.start_upload.assert_not_called()
+        self.assertEqual(youtube.resume_upload.call_args.args[0], "existing-session")
+        self.assertEqual(youtube.publish.call_args.args, ("abcdefghijk",))
+        self.assertEqual(youtube.publish.call_args.kwargs["title"], "#xQc Fixture")
 
     def test_thumbnail_failure_keeps_short_private(self):
         self.rights({"license": self.grant})
@@ -166,6 +198,18 @@ class ShortsEngineTests(unittest.TestCase):
         normal = {"description": "Source and commentary"}
         add_upload_hashtags(normal, "xqc", None, "unrelated topic")
         self.assertEqual(normal["hashtags"], ["#xQc", "#GTA6", "#GTAVI", "#TwitchClips"])
+
+    def test_title_has_one_canonical_prefix_within_youtube_limit(self):
+        for creator, (_, hashtag) in CAMPAIGNS.items():
+            original = f"{hashtag.lower()}: The side gate opens. {hashtag.upper()}"
+            title = format_upload_title(original, creator)
+            self.assertEqual(title, f"{hashtag} The side gate opens.")
+            self.assertEqual(format_upload_title(title, creator), title)
+        long_title = format_upload_title("An unexpected GTA VI scene " * 8, "ishowspeed")
+        self.assertTrue(long_title.startswith("#IShowSpeed "))
+        self.assertTrue(long_title.endswith("…"))
+        self.assertLessEqual(len(long_title), 100)
+        self.assertEqual(format_upload_title(long_title, "ishowspeed"), long_title)
 
     def test_viewer_quotes_require_clearance_timing_and_no_identifying_fields(self):
         evidence = "https://example.com/permission"

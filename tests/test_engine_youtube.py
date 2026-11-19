@@ -140,6 +140,26 @@ class YouTubeTest(unittest.TestCase):
             self.client.publish(VIDEO_ID, guard=lambda: next(allowed))
         self.assertEqual([call[0] for call in self.calls], ["GET", "GET"])
 
+    def test_promotion_can_correct_legacy_title_without_erasing_snippet_fields(self):
+        private = private_upload()
+        private["etag"] = '"original-version"'
+        private["snippet"].update(title="Original title", categoryId="20", defaultLanguage="en",
+                                  description="Clearance and source", tags=["GTA6", "xQc"])
+        title = "#xQc Original title"
+        public = {**private, "status": {**private["status"], "privacyStatus": "public"},
+                  "snippet": {**private["snippet"], "title": title}}
+        self.replies.extend([response(payload={"items": [CHANNEL]}), response(payload={"items": [private]}),
+                             response(payload=public), response(payload={"items": [public]})])
+
+        self.assertEqual(self.client.publish(VIDEO_ID, title=title), public)
+
+        method, _, request = self.calls[-2]
+        self.assertEqual(method, "PUT")
+        self.assertEqual(request["params"], {"part": "status,snippet"})
+        self.assertEqual(request["headers"]["If-Match"], '"original-version"')
+        self.assertEqual(request["json"]["snippet"], {"title": title, "categoryId": "20", "defaultLanguage": "en",
+                                                      "description": "Clearance and source", "tags": ["GTA6", "xQc"]})
+
     def test_sets_portrait_thumbnail_for_processed_owner_short(self):
         cover = self.file.with_suffix(".png")
         cover.write_bytes(PNG)
