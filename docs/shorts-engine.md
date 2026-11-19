@@ -2,6 +2,14 @@
 
 The service watches only [IShowSpeed](https://www.twitch.tv/ishowspeed), [Kai Cenat](https://www.twitch.tv/kaicenat), [JasonTheWeen](https://www.twitch.tv/jasontheween), [moistcr1tikal](https://www.twitch.tv/moistcr1tikal), and [xQc](https://www.twitch.tv/xqc). It accepts 7–30 second GTA VI streamer moments and publishes unattended to [@GTA-Vibing](https://www.youtube.com/@GTA-Vibing), channel `UCAtLKFamARYmLeTcwzA3akw`. The default threshold is 85 and the default rolling 24-hour limit is one public Short. A configured local publication time stays under control of the upload kill switch until promotion.
 
+## First upload through Twitch and Studio
+
+The signed-in Twitch and YouTube sites can handle the first clip before API setup. Once the chosen segment is cleared, use Twitch's Clip button on the live stream or VOD if the creator enables it. Download the landscape file from **Creator Dashboard → Content → Clips → Clips I've Created**, or use a cleared landscape export supplied by the creator. Keep the Twitch source link and the exact start time. [Twitch clip guide](https://help.twitch.tv/s/article/how-to-use-clips), [Twitch clip settings](https://help.twitch.tv/s/article/clips-settings)
+
+In the vertical edit, establish the premise in the first second, cut pauses, retain the reaction and payoff, and add accurate captions and original context. Use the full 7–30 second range as needed. Include cleared timed chat reactions and the exact campaign hashtag where applicable. Upload as private in [YouTube Studio](https://studio.youtube.com/channel/UCAtLKFamARYmLeTcwzA3akw), check playback and copyright results, then make it public. Submit an eligible campaign Short through the linked Content Rewards account within 30 minutes. [Content Rewards submissions](https://help.contentrewards.com/en/articles/15319814-submit-a-video)
+
+Record the exact commercial clearance for the clip, including third-party gameplay and audio. The sponsor’s campaign brief establishes what to submit. Content Rewards leaves third-party clearance with the clipper, and Rockstar’s public fan-footage policy covers noncommercial use. [Content Rewards terms, section 17](https://contentrewards.com/terms), [Rockstar footage policy](https://support.rockstargames.com/articles/7bNaeoMFTV0iUDGhStTXvz/policy-on-posting-copyrighted-rockstar-games-material)
+
 ## Account connection
 
 Run these commands in the repository. One-time Google consent and a Twitch registered application are required. An existing Studio or Twitch browser session does not supply API credentials.
@@ -60,7 +68,7 @@ Every upload gets description hashtags for the exact creator, `#GTA6`, `#GTAVI` 
 
 ## Campaigns and revenue
 
-- Kai's $10,000 pool covers Kai playing GTA VI during his marathon, with `#KaiCenat`. The member page showed at least 1,000 views per submission and 750,000 qualifying views total. [Kai Cenat campaign](https://contentrewards.com/c/campaigns/1d2bcb00-c904-415f-aa82-f95b96baad86)
+- Kai's $10,000 pool covers the GTA VI marathon beginning November 18. He must remain the primary focus throughout the edit. The caption or overlay must name him, the description must include `#KaiCenat`, and the rules exclude logos and negative or false framing. The member page showed at least 1,000 views per submission and 750,000 qualifying views total. [Kai Cenat campaign](https://contentrewards.com/c/campaigns/1d2bcb00-c904-415f-aa82-f95b96baad86), [Sponsor rule sheet](https://docs.google.com/document/d/1z3h2gDIdr2LFgDrSkXf6rIIA72y62nluKHdWgki5iG0/edit)
 - Jason's $9,000 pool names Jason as the primary focus, requires `#JasonTheWeen` and showed a 700,000 qualifying-view threshold. The signed-in brief listed November 30 as the closing date. The sponsor requires at least 50% of the audience from its five listed countries. [Jason campaign](https://contentrewards.com/c/campaigns/0b178e3c-fbd3-4294-8ded-394e3da9c62f), [Reach requirements](https://reachclipping.com/JasonTheWeen)
 - Both pools split verified views after the campaign ends. Joining a pool does not establish that all gameplay, music, source exports and other third-party material are cleared for commercial reuse. Paid jobs therefore require both asset-level evidence and a working submission path. Content Rewards requires a connected account and a submission within 30 minutes of posting. Its documented creator workflow is through its app, so the unattended engine holds campaign jobs after local production. [Content Rewards submissions](https://help.contentrewards.com/en/articles/15319814-submit-a-video), [Rockstar footage policy](https://support.rockstargames.com/articles/7bNaeoMFTV0iUDGhStTXvz/policy-on-posting-copyrighted-rockstar-games-material)
 
